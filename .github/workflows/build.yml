@@ -237,6 +237,10 @@ jobs:
       - name: Release'ga qo'yish
         env:
           GH_TOKEN: ${{ github.token }}
+          # Bu ishda `actions/checkout` yo'q (kod `src/` ga GitLab'dan keladi),
+          # ish papkasida `.git` yo'q — `gh` repo'ni git'dan topa olmay
+          # «not a git repository» bilan yiqilardi. GH_REPO uni aniq beradi.
+          GH_REPO: ${{ github.repository }}
           REF: ${{ needs.check.outputs.ref }}
         run: |
           set -euo pipefail
