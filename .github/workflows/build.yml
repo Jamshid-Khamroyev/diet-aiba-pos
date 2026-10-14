@@ -196,6 +196,10 @@ jobs:
 
       - name: O'rnatuvchi
         working-directory: src
+        env:
+          # Git Bash `/DAppVersion=..` ni fayl yo'liga aylantirib yubormasin.
+          MSYS_NO_PATHCONV: "1"
+          MSYS2_ARG_CONV_EXCL: "*"
         run: |
           VER=$(grep -m1 '^version:' pubspec.yaml | awk '{print $2}' | cut -d+ -f1)
           echo "VER=$VER" >> "$GITHUB_ENV"
