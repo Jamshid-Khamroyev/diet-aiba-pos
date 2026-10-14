@@ -99,7 +99,7 @@ jobs:
 
           PREV=$(gh release view latest --repo "$GITHUB_REPOSITORY" --json body -q .body 2>/dev/null \
                  | grep -oE 'SHA: [0-9a-f]{40}' | head -1 | cut -d' ' -f2 || true)
-          echo "Oxirgi yig'ilgan: ${PREV:-YO'Q}"
+          echo "Oxirgi yig'ilgan: ${PREV:-yoq}"
 
           CH=false
           [ "$SHA" != "$PREV" ] && CH=true
