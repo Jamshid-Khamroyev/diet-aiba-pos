@@ -41,10 +41,9 @@ concurrency:
 
 env:
   GITLAB_HOST: gitlab.aiba.uz
-  # Manba loyiha. Standart: asl repo. O'zgartirish uchun GitHub'da
-  # Settings -> Secrets and variables -> Actions -> Variables -> GITLAB_PATH
-  # (masalan j.xamroyev/diet-aiba-pos.git).
-  GITLAB_PATH: ${{ vars.GITLAB_PATH || 'a.asalbayev/diet-aiba-pos.git' }}
+  # Manba (production) loyiha: sizning shaxsiy GitLab loyihangiz. O'zgartirish:
+  # Settings -> Secrets and variables -> Actions -> Variables -> GITLAB_PATH.
+  GITLAB_PATH: ${{ vars.GITLAB_PATH || 'j.xamroyev/diet-aiba-pos.git' }}
 
 jobs:
   check:
@@ -72,12 +71,16 @@ jobs:
             git push
           fi
 
+      # Qaysi commit yig'ilishi kerak: GitLab pipeline'idan MUVAFFAQIYATLI
+      # o'tgan eng so'nggi commit (REQUIRE_PIPELINE=false bo'lsa shoxning
+      # oxirgi commit'i). Oxirgi yig'ilgan SHA bilan solishtiriladi.
       - id: cmp
         env:
           GL_USER: ${{ secrets.GITLAB_USER }}
           GL_TOKEN: ${{ secrets.GITLAB_TOKEN }}
           REF: ${{ github.event.inputs.ref || 'main' }}
           FORCE: ${{ github.event.inputs.force }}
+          REQUIRE_PIPELINE: ${{ vars.REQUIRE_PIPELINE || 'true' }}
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
@@ -85,17 +88,37 @@ jobs:
             echo "::error::GITLAB_USER / GITLAB_TOKEN secret qo'yilmagan (SOZLASH.md)"
             exit 1
           fi
-          # Branch nomi faqat oddiy belgilar bo'lsin.
           [[ "$REF" =~ ^[A-Za-z0-9._/-]+$ ]] || { echo "::error::noto'g'ri ref"; exit 1; }
 
           AUTH=$(printf '%s:%s' "$GL_USER" "$GL_TOKEN" | base64 -w0)
           echo "::add-mask::$AUTH"
 
-          # Olib bo'lmasa `set -e` shu yerda to'xtaydi — QIZIL, jim emas.
-          SHA=$(git -c "http.extraHeader=Authorization: Basic $AUTH" \
-            ls-remote "https://$GITLAB_HOST/$GITLAB_PATH" "refs/heads/$REF" "refs/tags/$REF" | head -1 | cut -f1)
-          [ -n "$SHA" ] || { echo "::error::GitLab'da '$REF' topilmadi yoki kirish rad etildi"; exit 1; }
-          echo "GitLab $REF = $SHA"
+          skip() {
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+            echo "sha=" >> "$GITHUB_OUTPUT"
+            echo "ref=$REF" >> "$GITHUB_OUTPUT"
+            exit 0
+          }
+
+          if [ "$REQUIRE_PIPELINE" = "true" ]; then
+            PROJ="${GITLAB_PATH%.git}"
+            PROJ="${PROJ//\//%2F}"
+            # Xato bo'lsa (401/403/404) QIZIL: jim «o'zgarish yo'q» emas.
+            BODY=$(curl -sS --fail-with-body -H "PRIVATE-TOKEN: $GL_TOKEN" \
+              "https://$GITLAB_HOST/api/v4/projects/$PROJ/pipelines?ref=$REF&status=success&order_by=id&sort=desc&per_page=1") \
+              || { echo "::error::GitLab API rad etdi (tokenda read_api huquqi bormi? loyiha yo'li to'g'rimi?): $BODY"; exit 1; }
+            SHA=$(printf '%s' "$BODY" | jq -r '.[0].sha // empty')
+            if [ -z "$SHA" ]; then
+              echo "::warning::$REF shoxida pipeline'dan muvaffaqiyatli o'tgan commit yo'q. Build qilinmaydi. GitLab -> Build -> Pipelines'ni tekshiring."
+              skip
+            fi
+            echo "Pipeline'dan o'tgan oxirgi commit ($REF) = $SHA"
+          else
+            SHA=$(git -c "http.extraHeader=Authorization: Basic $AUTH" \
+              ls-remote "https://$GITLAB_HOST/$GITLAB_PATH" "refs/heads/$REF" "refs/tags/$REF" | head -1 | cut -f1)
+            [ -n "$SHA" ] || { echo "::error::GitLab'da $REF topilmadi yoki kirish rad etildi"; exit 1; }
+            echo "GitLab $REF = $SHA (pipeline tekshirilmaydi)"
+          fi
 
           PREV=$(gh release view latest --repo "$GITHUB_REPOSITORY" --json body -q .body 2>/dev/null \
                  | grep -oE 'SHA: [0-9a-f]{40}' | head -1 | cut -d' ' -f2 || true)
@@ -104,11 +127,10 @@ jobs:
           CH=false
           [ "$SHA" != "$PREV" ] && CH=true
           [ "$FORCE" = "true" ] && CH=true
-          [ "${{ github.event_name }}" = "workflow_dispatch" ] && [ "$REF" != "main" ] && CH=true
           echo "changed=$CH" >> "$GITHUB_OUTPUT"
           echo "sha=$SHA"    >> "$GITHUB_OUTPUT"
           echo "ref=$REF"    >> "$GITHUB_OUTPUT"
-          [ "$CH" = true ] && echo "Yangilik bor — build ketadi." || echo "O'zgarish yo'q."
+          [ "$CH" = true ] && echo "Yangi commit bor: build ketadi." || echo "Yangilik yo'q."
 
   windows:
     needs: check
@@ -121,17 +143,20 @@ jobs:
       run:
         shell: bash
     steps:
-      - name: Kodni GitLab'dan olish
+      - name: Kodni GitLab'dan olish (aniq commit)
         env:
           GL_USER: ${{ secrets.GITLAB_USER }}
           GL_TOKEN: ${{ secrets.GITLAB_TOKEN }}
-          REF: ${{ needs.check.outputs.ref }}
+          SHA: ${{ needs.check.outputs.sha }}
         run: |
           set -euo pipefail
+          [[ "$SHA" =~ ^[0-9a-f]{40}$ ]] || { echo "::error::noto'g'ri SHA"; exit 1; }
           AUTH=$(printf '%s:%s' "$GL_USER" "$GL_TOKEN" | base64 -w0)
           echo "::add-mask::$AUTH"
-          git -c "http.extraHeader=Authorization: Basic $AUTH" \
-            clone --depth 1 --branch "$REF" "https://$GITLAB_HOST/$GITLAB_PATH" src
+          git init -q src
+          git -C src -c "http.extraHeader=Authorization: Basic $AUTH" \
+            fetch --depth 1 "https://$GITLAB_HOST/$GITLAB_PATH" "$SHA"
+          git -C src checkout -q FETCH_HEAD
           echo "BUILT_SHA=$(git -C src rev-parse HEAD)" >> "$GITHUB_ENV"
 
       # Printer PowerShell skriptlarining sintaksisi HAQIQIY Windows'da
@@ -194,17 +219,18 @@ jobs:
       - name: Inno Setup
         run: choco install innosetup -y --no-progress
 
+      - name: Versiyani o'qish
+        run: echo "VER=$(grep -m1 '^version:' src/pubspec.yaml | awk '{print $2}' | cut -d+ -f1 | tr -d '\r')" >> "$GITHUB_ENV"
+
+      # PowerShell'da: Git Bash `/DAppVersion=..` ni fayl yo'liga aylantirib
+      # yuborib, iscc «more than one script filename» deb yiqilardi.
       - name: O'rnatuvchi
+        shell: pwsh
         working-directory: src
-        env:
-          # Git Bash `/DAppVersion=..` ni fayl yo'liga aylantirib yubormasin.
-          MSYS_NO_PATHCONV: "1"
-          MSYS2_ARG_CONV_EXCL: "*"
         run: |
-          VER=$(grep -m1 '^version:' pubspec.yaml | awk '{print $2}' | cut -d+ -f1)
-          echo "VER=$VER" >> "$GITHUB_ENV"
-          iscc "/DAppVersion=$VER" windows/installer.iss
-          ls windows/Output
+          iscc "/DAppVersion=$env:VER" windows/installer.iss
+          if ($LASTEXITCODE -ne 0) { throw "iscc xato bilan tugadi: $LASTEXITCODE" }
+          Get-ChildItem windows/Output
 
       # Release: standart `gh` bilan (uchinchi tomon action kerak emas).
       # Havola o'zgarmaydi: .../releases/latest
