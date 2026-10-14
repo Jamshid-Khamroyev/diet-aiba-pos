@@ -1,0 +1,7 @@
+version: 2
+updates:
+  # SHA'ga mahkamlangan action'larni xavfsiz yangilab turadi.
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: monthly

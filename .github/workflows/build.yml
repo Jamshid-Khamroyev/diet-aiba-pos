@@ -1,0 +1,237 @@
+# DIET-AIBA POS — Windows o'rnatuvchisini yig'ish va Release'ga qo'yish.
+#
+# BU REPODA KOD YO'Q va bo'lmaydi. Manba yopiq GitLab'da. Build paytida
+# kod vaqtincha GitLab'dan klon qilinadi, yig'iladi, FAQAT o'rnatuvchi
+# (.exe) Release'ga qo'yiladi. Ish tugagach mashina o'chiriladi.
+#
+# Har 15 daqiqada GitLab'dagi `main` tekshiriladi: SHA oxirgi yig'ilganidan
+# farq qilsa build ketadi. Oxirgi yig'ilgan SHA «latest» Release matnida
+# saqlanadi (repoga hech narsa commit qilinmaydi).
+#
+# XAVFSIZLIK:
+#  * Triggerlar faqat schedule va qo'lda ishga tushirish: pull request /
+#    fork orqali secret'larga yetib bo'lmaydi.
+#  * Standart ruxsat YO'Q (`permissions: {}`), har ish o'zi keraklisini oladi.
+#  * Uchinchi tomon action'lar commit SHA'ga mahkamlangan.
+#  * GitLab kaliti klon URL'ida emas, vaqtinchalik HTTP sarlavhada
+#    ishlatiladi va log'da yashirinadi; `.git/config` ga yozilmaydi.
+#  * Kalit yo'q yoki GitLab javob bermasa ish QIZIL bo'ladi (jim o'tmaydi).
+
+name: Build
+
+on:
+  schedule:
+    - cron: "*/15 * * * *"
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: "GitLab branch yoki tag (odatda main)"
+        default: main
+      force:
+        description: "SHA o'zgarmagan bo'lsa ham qayta yig'ilsin"
+        type: boolean
+        default: false
+
+permissions: {}
+
+# Ikki build bir vaqtda bitta relizni yozmasin; yangisi navbatda kutadi.
+concurrency:
+  group: build
+  cancel-in-progress: false
+
+env:
+  GITLAB_HOST: gitlab.aiba.uz
+  # Manba loyiha. Standart: asl repo. O'zgartirish uchun GitHub'da
+  # Settings -> Secrets and variables -> Actions -> Variables -> GITLAB_PATH
+  # (masalan j.xamroyev/diet-aiba-pos.git).
+  GITLAB_PATH: ${{ vars.GITLAB_PATH || 'a.asalbayev/diet-aiba-pos.git' }}
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write # reliz o'qish + 45 kunda bir marta «tirik» commit
+    outputs:
+      changed: ${{ steps.cmp.outputs.changed }}
+      sha: ${{ steps.cmp.outputs.sha }}
+      ref: ${{ steps.cmp.outputs.ref }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 1
+
+      # GitHub 60 kun faolsiz repoda jadvalli ishlarni O'CHIRIB qo'yadi.
+      # Oxirgi commit 45 kundan eski bo'lsa bo'sh commit qo'yamiz.
+      - name: Jadval o'chib qolmasin
+        run: |
+          age=$(( $(date +%s) - $(git log -1 --format=%ct) ))
+          if [ "$age" -gt $(( 45*24*3600 )) ]; then
+            git config user.name  "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git commit --allow-empty -m "chore: jadvalni tirik saqlash"
+            git push
+          fi
+
+      - id: cmp
+        env:
+          GL_USER: ${{ secrets.GITLAB_USER }}
+          GL_TOKEN: ${{ secrets.GITLAB_TOKEN }}
+          REF: ${{ github.event.inputs.ref || 'main' }}
+          FORCE: ${{ github.event.inputs.force }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          if [ -z "$GL_USER" ] || [ -z "$GL_TOKEN" ]; then
+            echo "::error::GITLAB_USER / GITLAB_TOKEN secret qo'yilmagan (SOZLASH.md)"
+            exit 1
+          fi
+          # Branch nomi faqat oddiy belgilar bo'lsin.
+          [[ "$REF" =~ ^[A-Za-z0-9._/-]+$ ]] || { echo "::error::noto'g'ri ref"; exit 1; }
+
+          AUTH=$(printf '%s:%s' "$GL_USER" "$GL_TOKEN" | base64 -w0)
+          echo "::add-mask::$AUTH"
+
+          # Olib bo'lmasa `set -e` shu yerda to'xtaydi — QIZIL, jim emas.
+          SHA=$(git -c "http.extraHeader=Authorization: Basic $AUTH" \
+            ls-remote "https://$GITLAB_HOST/$GITLAB_PATH" "refs/heads/$REF" "refs/tags/$REF" | head -1 | cut -f1)
+          [ -n "$SHA" ] || { echo "::error::GitLab'da '$REF' topilmadi yoki kirish rad etildi"; exit 1; }
+          echo "GitLab $REF = $SHA"
+
+          PREV=$(gh release view latest --repo "$GITHUB_REPOSITORY" --json body -q .body 2>/dev/null \
+                 | grep -oE 'SHA: [0-9a-f]{40}' | head -1 | cut -d' ' -f2 || true)
+          echo "Oxirgi yig'ilgan: ${PREV:-YO'Q}"
+
+          CH=false
+          [ "$SHA" != "$PREV" ] && CH=true
+          [ "$FORCE" = "true" ] && CH=true
+          [ "${{ github.event_name }}" = "workflow_dispatch" ] && [ "$REF" != "main" ] && CH=true
+          echo "changed=$CH" >> "$GITHUB_OUTPUT"
+          echo "sha=$SHA"    >> "$GITHUB_OUTPUT"
+          echo "ref=$REF"    >> "$GITHUB_OUTPUT"
+          [ "$CH" = true ] && echo "Yangilik bor — build ketadi." || echo "O'zgarish yo'q."
+
+  windows:
+    needs: check
+    if: needs.check.outputs.changed == 'true'
+    runs-on: windows-latest
+    permissions:
+      contents: write # Release yaratish/yangilash
+    timeout-minutes: 45
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Kodni GitLab'dan olish
+        env:
+          GL_USER: ${{ secrets.GITLAB_USER }}
+          GL_TOKEN: ${{ secrets.GITLAB_TOKEN }}
+          REF: ${{ needs.check.outputs.ref }}
+        run: |
+          set -euo pipefail
+          AUTH=$(printf '%s:%s' "$GL_USER" "$GL_TOKEN" | base64 -w0)
+          echo "::add-mask::$AUTH"
+          git -c "http.extraHeader=Authorization: Basic $AUTH" \
+            clone --depth 1 --branch "$REF" "https://$GITLAB_HOST/$GITLAB_PATH" src
+          echo "BUILT_SHA=$(git -C src rev-parse HEAD)" >> "$GITHUB_ENV"
+
+      # Printer PowerShell skriptlarining sintaksisi HAQIQIY Windows'da
+      # tekshiriladi (ishga TUSHIRILMAYDI). Xato bo'lsa build shu yerda to'xtaydi.
+      - name: Printer skriptlari sintaksisi
+        shell: pwsh
+        run: |
+          $file = "src/lib/features/printing/data/printer_service.dart"
+          if (-not (Test-Path $file)) { Write-Host "::warning::$file topilmadi - o'tkazib yuborildi"; exit 0 }
+          $src = Get-Content -Raw $file
+          $q3 = [char]39 + [char]39 + [char]39
+          $rx = [regex]("(?s)r" + $q3 + "(.*?)" + $q3)
+          $n = 0; $bad = 0
+          foreach ($m in $rx.Matches($src)) {
+            $code = $m.Groups[1].Value
+            if ($code -notmatch 'Get-Print|Set-Printer|Write-Output|Start-Sleep|Get-Service') { continue }
+            $n++; $errs = $null
+            [System.Management.Automation.Language.Parser]::ParseInput($code, [ref]$null, [ref]$errs) | Out-Null
+            if ($errs -and $errs.Count -gt 0) {
+              $bad++
+              foreach ($e in $errs) { Write-Host ("::error::Skript #" + $n + ", " + $e.Extent.StartLineNumber + "-qator: " + $e.Message) }
+            }
+          }
+          Write-Host ("Tekshirildi: " + $n + " ta skript, xato: " + $bad)
+          if ($bad -gt 0) { exit 1 }
+
+      - uses: subosito/flutter-action@1a449444c387b1966244ae4d4f8c696479add0b2 # v2.23.0
+        with:
+          channel: stable
+          cache: true
+
+      - name: Windows desktop yoqish
+        run: flutter config --enable-windows-desktop
+
+      - name: Bog'liqliklar
+        working-directory: src
+        run: flutter pub get
+
+      - name: Tekshiruv
+        working-directory: src
+        run: flutter analyze
+
+      - name: Qurish
+        working-directory: src
+        run: flutter build windows --release
+
+      # Flutter MSVC runtime'ni o'zi nusxalamaydi (windows/CMakeLists.txt
+      # qo'shadi). Yo'qolsa ilova toza Windows'da JIM ochilmaydi.
+      - name: VC++ runtime va ikonka joyidami
+        shell: pwsh
+        working-directory: src
+        run: |
+          $dir = "build/windows/x64/runner/Release"
+          $need = @("msvcp140.dll", "vcruntime140.dll", "vcruntime140_1.dll")
+          $missing = $need | Where-Object { -not (Test-Path (Join-Path $dir $_)) }
+          if ($missing) { throw "MSVC runtime yetishmaydi: $($missing -join ', ')" }
+          if (-not (Test-Path "windows/runner/resources/app_icon.ico")) { throw "Ikonka topilmadi" }
+          Write-Host "VC++ runtime va ikonka joyida"
+
+      - name: Inno Setup
+        run: choco install innosetup -y --no-progress
+
+      - name: O'rnatuvchi
+        working-directory: src
+        run: |
+          VER=$(grep -m1 '^version:' pubspec.yaml | awk '{print $2}' | cut -d+ -f1)
+          echo "VER=$VER" >> "$GITHUB_ENV"
+          iscc "/DAppVersion=$VER" windows/installer.iss
+          ls windows/Output
+
+      # Release: standart `gh` bilan (uchinchi tomon action kerak emas).
+      # Havola o'zgarmaydi: .../releases/latest
+      - name: Release'ga qo'yish
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REF: ${{ needs.check.outputs.ref }}
+        run: |
+          set -euo pipefail
+          EXE=$(ls src/windows/Output/*.exe)
+          NAME=$(basename "$EXE")
+          cat > notes.md <<EOF
+          Windows o'rnatuvchisi (64-bit Windows 10 / 11).
+
+          Faylni yuklab, ikki marta bosing. Windows «noma'lum nashriyot»
+          desa: **Batafsil -> Baribir ishga tushirish** (o'rnatuvchi
+          raqamli imzolanmagan, virus emas).
+
+          Versiya: ${VER}
+          Yig'ilgan: $(date -u +%Y-%m-%d' '%H:%M) UTC
+          Manba: ${REF}
+          SHA: ${BUILT_SHA}
+          EOF
+
+          gh release view latest >/dev/null 2>&1 \
+            || gh release create latest --title "DIET-AIBA POS — o'rnatuvchi" --notes "tayyorlanmoqda" --latest
+          gh release upload latest "$EXE" --clobber
+          # Eski versiyali fayllar qolib ketmasin.
+          for a in $(gh release view latest --json assets -q '.assets[].name'); do
+            [ "$a" = "$NAME" ] || gh release delete-asset latest "$a" -y
+          done
+          # SHA matni ENG OXIRIDA yoziladi: build to'liq tugamasa «yig'ilgan»
+          # deb belgilanib qolmaydi va keyingi tekshiruvda qayta uriniladi.
+          gh release edit latest --notes-file notes.md --latest
